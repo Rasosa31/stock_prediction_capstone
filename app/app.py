@@ -194,7 +194,7 @@ def health_check():
     return {"status": "healthy"}
 
 @app.post("/predict_json")
-<<<<<<< HEAD
+
 def predict_json(body: dict):
     # Accept JSON object like {"ticker": "AAPL"} and proxy to predict_ticker
     ticker = body.get('ticker') if isinstance(body, dict) else None
@@ -247,9 +247,9 @@ def debug_download(ticker: str, start: str = None, end: str = None):
 # Redefining the endpoint to fetch data on demand (easier for client)
 @app.post("/predict_ticker")
 def predict_ticker(ticker: str):
-=======
+
 def predict_json(request: TickerRequest):
->>>>>>> 08614297f9132ef9ca3eac55728c91b26177c32a
+
     from src.utils import load_data_with_indicators
     from src.strategy import get_signal, calculate_sl_tp
     
