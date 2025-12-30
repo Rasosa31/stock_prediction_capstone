@@ -13,7 +13,10 @@ import datetime
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(BASE_DIR)
 
+# Importaciones de tu proyecto
 from src.model import create_sequences
+from src.utils import load_data_with_indicators
+from src.strategy import get_signal, calculate_sl_tp
 
 app = FastAPI(title="Stock Prediction API")
 
@@ -133,7 +136,8 @@ def root():
 
         <script>
             async function makePrediction() {
-                const ticker = document.getElementById('tickerInput').value.trim().toUpperCase();
+                const tickerInput = document.getElementById('tickerInput');
+                const ticker = tickerInput.value.trim().toUpperCase();
                 if (!ticker) return;
 
                 const btn = document.getElementById('btnPredict');
@@ -174,7 +178,7 @@ def root():
                         
                         result.classList.remove('hidden');
                     } else {
-                        alert('Error: ' + data.detail);
+                        alert('Error: ' + (data.detail || 'Fallo en la predicción'));
                     }
                 } catch (err) {
                     alert('Error de conexión con la API');
@@ -194,112 +198,59 @@ def health_check():
     return {"status": "healthy"}
 
 @app.post("/predict_json")
-
-def predict_json(body: dict):
-    # Accept JSON object like {"ticker": "AAPL"} and proxy to predict_ticker
-    ticker = body.get('ticker') if isinstance(body, dict) else None
-    if not ticker:
-        raise HTTPException(status_code=400, detail="Missing 'ticker' in JSON body")
-    return predict_ticker(ticker)
-
-
-@app.get("/debug/download")
-def debug_download(ticker: str, start: str = None, end: str = None):
-    """Debug endpoint: attempt to download data for a ticker and return simple diagnostics.
-
-    Use query params: `ticker`, optional `start` and `end` in YYYY-MM-DD.
-    """
-    from src.utils import download_data
-    import datetime
-
-    # Expose which provider and whether ALPHA_VANTAGE_KEY is set (masked) for debugging
-    provider = os.environ.get('DATA_PROVIDER', 'yahoo')
-    key_present = bool(os.environ.get('ALPHA_VANTAGE_KEY'))
-
-    try:
-        if not start or not end:
-            end_date = datetime.datetime.now()
-            start_date = end_date - datetime.timedelta(days=365)
-            start = start or start_date.strftime('%Y-%m-%d')
-            end = end or end_date.strftime('%Y-%m-%d')
-
-        df = download_data(ticker, start, end)
-
-        # Return small diagnostics (head/tail as dicts)
-        head = df.head(3).astype(object).to_dict(orient='list')
-        tail = df.tail(3).astype(object).to_dict(orient='list')
-        return {
-            'ticker': ticker,
-            'start': start,
-            'end': end,
-            'rows': len(df),
-            'provider': provider,
-            'alpha_vantage_key_present': key_present,
-            'head': head,
-            'tail': tail
-        }
-
-    except Exception as e:
-        # If the download failed, attempt to include the raw Alpha Vantage response if available
-        return JSONResponse(status_code=500, content={'detail': str(e), 'provider': provider, 'alpha_vantage_key_present': key_present})
-
-# Redefining the endpoint to fetch data on demand (easier for client)
 def predict_json(request: TickerRequest):
-
-    from src.utils import load_data_with_indicators
-    from src.strategy import get_signal, calculate_sl_tp
-    
     load_resources()
     
     if model is None or scaler is None:
-        raise HTTPException(status_code=500, detail="El modelo o el scaler no están disponibles.")
+        raise HTTPException(status_code=500, detail="Recursos del modelo no cargados en el servidor.")
 
     ticker = request.ticker.upper()
     end_date = datetime.datetime.now()
     start_date = end_date - datetime.timedelta(days=730)
 
     try:
+        # Cargar datos e indicadores
         df = load_data_with_indicators(ticker, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
+        
+        # Filtrar solo columnas numéricas que el modelo espera
         numeric_df = df.select_dtypes(include=[np.number])
         expected_length = model.input_shape[1] 
         
         if len(numeric_df) < expected_length:
-             raise HTTPException(status_code=400, detail=f"Datos insuficientes.")
+             raise HTTPException(status_code=400, detail=f"Datos históricos insuficientes para {ticker}.")
 
-        scaled_data = scaler.transform(numeric_df.values)
+        # Escalar datos (Usamos la columna Close para el scaler)
+        scaled_data = scaler.transform(numeric_df[['Close']].values)
+        
+        # Crear secuencia para el modelo LSTM
         last_sequence = scaled_data[-expected_length:]
         last_sequence = np.expand_dims(last_sequence, axis=0)
 
+        # Predicción
         prediction_scaled_val = model.predict(last_sequence, verbose=0)[0, 0]
 
-        current_price = df['Close'].iloc[-1]
-        real_min = df['Close'].min()
-        real_max = df['Close'].max()
-        
-        # Inversa manual Min-Max
+        # Inversa manual del escalado basada en el histórico actual (más robusto)
+        current_price = float(df['Close'].iloc[-1])
+        real_min = float(df['Close'].min())
+        real_max = float(df['Close'].max())
         prediction_final = prediction_scaled_val * (real_max - real_min) + real_min
         
-        # Filtro de seguridad (Safety paracaídas)
-        if prediction_final < (current_price * 0.5) or prediction_final > (current_price * 1.5):
-            last_scaled_val = scaled_data[-1, 0]
-            change_ratio = prediction_scaled_val / last_scaled_val if last_scaled_val != 0 else 1
-            prediction_final = current_price * change_ratio
-
-        volatility = df.get('BB_Std', pd.Series([0])).iloc[-1] if 'BB_Std' in df.columns else 0
+        # Cálculo de estrategia
+        volatility = float(df['BB_Std'].iloc[-1]) if 'BB_Std' in df.columns else 0
         signal = get_signal(current_price, prediction_final)
         stop_loss, take_profit = calculate_sl_tp(current_price, signal, volatility)
         pct_change = ((prediction_final - current_price) / current_price) * 100
         
         return {
             "ticker": ticker,
-            "current_price": round(float(current_price), 2),
+            "current_price": round(current_price, 2),
             "predicted_price": round(float(prediction_final), 2),
             "percent_change": f"{round(float(pct_change), 2)}%",
             "signal": signal,
             "stop_loss": round(float(stop_loss), 2),
             "take_profit": round(float(take_profit), 2),
-            "date_of_prediction": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             "status": "Success"
         }
     except Exception as e:
+        print(f"Error en predicción: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
