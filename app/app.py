@@ -243,11 +243,7 @@ def debug_download(ticker: str, start: str = None, end: str = None):
         # If the download failed, attempt to include the raw Alpha Vantage response if available
         return JSONResponse(status_code=500, content={'detail': str(e), 'provider': provider, 'alpha_vantage_key_present': key_present})
 
-
 # Redefining the endpoint to fetch data on demand (easier for client)
-@app.post("/predict_ticker")
-def predict_ticker(ticker: str):
-
 def predict_json(request: TickerRequest):
 
     from src.utils import load_data_with_indicators
