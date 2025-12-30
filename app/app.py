@@ -209,33 +209,52 @@ def predict_json(request: TickerRequest):
     start_date = end_date - datetime.timedelta(days=730)
 
     try:
-        # Cargar datos e indicadores
+        # 1. Cargar datos e indicadores (YahooQuery según tu log anterior)
         df = load_data_with_indicators(ticker, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
         
-        # Filtrar solo columnas numéricas que el modelo espera
+        # 2. Seleccionar columnas numéricas (El log mostró 12 columnas incluyendo indicadores)
         numeric_df = df.select_dtypes(include=[np.number])
-        expected_length = model.input_shape[1] 
         
-        if len(numeric_df) < expected_length:
-             raise HTTPException(status_code=400, detail=f"Datos históricos insuficientes para {ticker}.")
-
-        # Escalar datos (Usamos la columna Close para el scaler)
-        scaled_data = scaler.transform(numeric_df[['Close']].values)
+        # Obtener dimensiones esperadas por el modelo cargado
+        # Forma esperada: (None, timesteps, features)
+        expected_timesteps = model.input_shape[1]
+        expected_features = model.input_shape[2] 
         
-        # Crear secuencia para el modelo LSTM
-        last_sequence = scaled_data[-expected_length:]
-        last_sequence = np.expand_dims(last_sequence, axis=0)
+        if len(numeric_df) < expected_timesteps:
+             raise HTTPException(status_code=400, detail=f"Datos históricos insuficientes para {ticker}. Se requieren {expected_timesteps} días.")
 
-        # Predicción
+        # 3. Preparación de Features (Asegurar que enviamos las 12 columnas)
+        # Tomamos las últimas columnas según lo que espera el modelo
+        data_to_scale = numeric_df.iloc[:, :expected_features].values
+        
+        # 4. Escalar y Crear Secuencia
+        # Si el scaler fue entrenado con 12 columnas, transformará todo. 
+        # Si fue entrenado con 1, usaremos un escalado manual o parcial.
+        try:
+            scaled_data = scaler.transform(data_to_scale)
+        except:
+            # Fallback en caso de que el scaler pida solo 1 columna pero el modelo pida 12
+            # Escalamos solo la columna Close (asumiendo que es la principal) y repetimos o ajustamos
+            close_scaled = scaler.transform(numeric_df[['Close']].values)
+            # Creamos una matriz de ceros con la forma correcta y ponemos el close escalado
+            scaled_data = np.zeros((len(close_scaled), expected_features))
+            scaled_data[:, 0] = close_scaled.flatten() 
+
+        last_sequence = scaled_data[-expected_timesteps:]
+        last_sequence = np.expand_dims(last_sequence, axis=0) # Shape: (1, timesteps, 12)
+
+        # 5. Ejecutar Predicción
         prediction_scaled_val = model.predict(last_sequence, verbose=0)[0, 0]
 
-        # Inversa manual del escalado basada en el histórico actual (más robusto)
+        # 6. Des-escalado Manual (Inversa de Min-Max)
         current_price = float(df['Close'].iloc[-1])
         real_min = float(df['Close'].min())
         real_max = float(df['Close'].max())
+        
+        # La fórmula: x = x_scaled * (max - min) + min
         prediction_final = prediction_scaled_val * (real_max - real_min) + real_min
         
-        # Cálculo de estrategia
+        # 7. Cálculo de Estrategia y Respuesta
         volatility = float(df['BB_Std'].iloc[-1]) if 'BB_Std' in df.columns else 0
         signal = get_signal(current_price, prediction_final)
         stop_loss, take_profit = calculate_sl_tp(current_price, signal, volatility)
@@ -252,5 +271,5 @@ def predict_json(request: TickerRequest):
             "status": "Success"
         }
     except Exception as e:
-        print(f"Error en predicción: {str(e)}")
+        print(f"Error crítico en predicción: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
